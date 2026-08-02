@@ -1,0 +1,54 @@
+name: Download NSE delivery data
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub cron uses UTC. These are 07:00, 16:00, 17:00, 18:00,
+    # 19:00, 20:00 and 22:00 IST (UTC+05:30).
+    - cron: "30 1,10,11,12,13,14,16 * * *"
+    # These are 16:30 and 17:30 IST.
+    - cron: "0 11,12 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nse-delivery-data-download
+  cancel-in-progress: false
+
+jobs:
+  download-and-commit:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download missing delivery data
+        shell: cmd
+        run: call delivery_data_downloader.bat
+
+      - name: Commit and push newly downloaded CSV files
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- "Day_Delivery/NSE/*.csv"
+          if (git diff --cached --quiet) {
+            Write-Host "No new delivery CSV files to commit."
+            exit 0
+          }
+
+          $downloadedFiles = @(git diff --cached --name-only --diff-filter=A)
+          if ($downloadedFiles.Count -eq 0) {
+            Write-Host "No newly downloaded files to commit."
+            git reset
+            exit 0
+          }
+
+          git commit -m "data: download NSE delivery data"
+          git push origin HEAD:${{ github.event.repository.default_branch }}

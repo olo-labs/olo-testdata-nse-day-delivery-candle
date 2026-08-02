@@ -43,7 +43,9 @@ $missingDates = @($targetDates | Where-Object {
 
 $successCount = 0
 $failCount = 0
+$unavailableCount = 0
 $failDates = @()
+$unavailableDates = @()
 
 Write-Host "[INFO] Output folder: $OutputFolder"
 Write-Host "[INFO] Configured range: $($StartDate.ToString('dd-MMM-yyyy')) to $($EndDate.ToString('dd-MMM-yyyy'))"
@@ -77,7 +79,11 @@ for ($i = 0; $i -lt $missingDates.Count; $i++) {
         ) -and $dataDate.Date -eq $targetDate
 
         if (-not $isExpectedDate) {
-            throw "NSE returned data for '$dataDateText' instead of '$dateStr' (likely a market holiday)"
+            Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+            Write-Host "    -> UNAVAILABLE: NSE returned data for '$dataDateText' instead of '$dateStr' (likely a market holiday)" -ForegroundColor DarkYellow
+            $unavailableCount++
+            $unavailableDates += $dateStr
+            continue
         }
 
         Move-Item -LiteralPath $tempFile -Destination $csvFile -Force
@@ -93,9 +99,12 @@ for ($i = 0; $i -lt $missingDates.Count; $i++) {
     Start-Sleep -Seconds 1
 }
 
-Write-Host "[SUMMARY] Downloaded: $successCount   Unavailable/failed: $failCount   Missing checked: $($missingDates.Count)"
+Write-Host "[SUMMARY] Downloaded: $successCount   Unavailable: $unavailableCount   Failed: $failCount   Missing checked: $($missingDates.Count)"
+if ($unavailableDates.Count -gt 0) {
+    Write-Host "  Unavailable dates: $($unavailableDates -join ', ')"
+}
 if ($failDates.Count -gt 0) {
-    Write-Host "  Unavailable/failed dates: $($failDates -join ', ')"
+    Write-Host "  Failed dates: $($failDates -join ', ')"
 }
 Write-Host "Done. Files saved in $OutputFolder"
 
