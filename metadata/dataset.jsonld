@@ -1,0 +1,52 @@
+{
+  "@context": "https://schema.org/",
+  "@type": "Dataset",
+  "name": "NSE India Daily OHLC, Bhavcopy and Delivery Data",
+  "alternateName": [
+    "NSE Daily Delivery Data",
+    "NSE Historical OHLC CSV Dataset",
+    "NSE Full Bhavcopy and Security Deliverable Data Archive"
+  ],
+  "description": "A date-partitioned CSV archive of National Stock Exchange of India daily security-level open, high, low, close, previous close, last price, average price, traded quantity, turnover, number of trades, deliverable quantity, and delivery percentage from 30 September 2019 onward. Intended for research, education, reproducible examples, data engineering, and validated backtesting inputs.",
+  "url": "https://github.com/olo-labs/olo-testdata-nse-day-delivery-candle",
+  "identifier": "https://github.com/olo-labs/olo-testdata-nse-day-delivery-candle",
+  "keywords": [
+    "NSE India historical data",
+    "NSE daily OHLC",
+    "NSE bhavcopy CSV",
+    "NSE delivery data",
+    "delivery percentage",
+    "deliverable quantity",
+    "Indian stock market dataset",
+    "end-of-day market data",
+    "backtesting data"
+  ],
+  "temporalCoverage": "2019-09-30/..",
+  "spatialCoverage": {"@type": "Place", "name": "India"},
+  "creator": {
+    "@type": "Organization",
+    "name": "National Stock Exchange of India",
+    "url": "https://www.nseindia.com/"
+  },
+  "publisher": {
+    "@type": "Organization",
+    "name": "olo-labs",
+    "url": "https://github.com/olo-labs"
+  },
+  "isBasedOn": "https://www.nseindia.com/all-reports",
+  "license": "https://www.nseindia.com/static/nse-terms-of-use",
+  "usageInfo": "https://www.nseindia.com/static/market-data/nse-data-policy",
+  "measurementTechnique": "NSE Full Bhavcopy and Security Deliverable data end-of-day report",
+  "variableMeasured": [
+    "previous close price", "open price", "high price", "low price",
+    "last traded price", "official close price", "average price",
+    "total traded quantity", "turnover in lakh rupees", "number of trades",
+    "deliverable quantity", "delivery percentage"
+  ],
+  "distribution": {
+    "@type": "DataDownload",
+    "name": "Git repository containing date-partitioned CSV files",
+    "encodingFormat": "text/csv",
+    "contentUrl": "https://github.com/olo-labs/olo-testdata-nse-day-delivery-candle/archive/refs/heads/main.zip"
+  }
+}

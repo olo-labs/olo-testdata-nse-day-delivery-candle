@@ -1,0 +1,27 @@
+{
+  "@context": "http://www.w3.org/ns/csvw",
+  "url": "../Day_Delivery/NSE/delivery_*.csv",
+  "dc:title": "NSE India Daily OHLC, Bhavcopy and Delivery CSV Schema",
+  "dc:description": "Column metadata shared by normal daily delivery CSV files in this repository.",
+  "dialect": {"delimiter": ",", "header": true, "trim": "start", "encoding": "utf-8"},
+  "tableSchema": {
+    "primaryKey": ["DATE1", "SYMBOL", "SERIES"],
+    "columns": [
+      {"name": "SYMBOL", "titles": "SYMBOL", "datatype": "string", "required": true, "dc:description": "NSE trading symbol."},
+      {"name": "SERIES", "titles": "SERIES", "datatype": "string", "required": true, "dc:description": "NSE security or market series."},
+      {"name": "DATE1", "titles": "DATE1", "datatype": {"base": "date", "format": "dd-MMM-yyyy"}, "required": true, "dc:description": "Trading/report date."},
+      {"name": "PREV_CLOSE", "titles": "PREV_CLOSE", "datatype": "decimal", "dc:description": "Previous applicable closing price."},
+      {"name": "OPEN_PRICE", "titles": "OPEN_PRICE", "datatype": "decimal", "dc:description": "Session opening price."},
+      {"name": "HIGH_PRICE", "titles": "HIGH_PRICE", "datatype": "decimal", "dc:description": "Session highest price."},
+      {"name": "LOW_PRICE", "titles": "LOW_PRICE", "datatype": "decimal", "dc:description": "Session lowest price."},
+      {"name": "LAST_PRICE", "titles": "LAST_PRICE", "datatype": "decimal", "dc:description": "Last traded price."},
+      {"name": "CLOSE_PRICE", "titles": "CLOSE_PRICE", "datatype": "decimal", "dc:description": "Official session closing price."},
+      {"name": "AVG_PRICE", "titles": "AVG_PRICE", "datatype": "decimal", "dc:description": "Average traded price reported by NSE."},
+      {"name": "TTL_TRD_QNTY", "titles": "TTL_TRD_QNTY", "datatype": {"base": "integer", "minimum": 0}, "dc:description": "Total traded quantity."},
+      {"name": "TURNOVER_LACS", "titles": "TURNOVER_LACS", "datatype": {"base": "decimal", "minimum": 0}, "dc:description": "Turnover in lakh rupees for INR-denominated instruments."},
+      {"name": "NO_OF_TRADES", "titles": "NO_OF_TRADES", "datatype": {"base": "integer", "minimum": 0}, "dc:description": "Number of trades."},
+      {"name": "DELIV_QTY", "titles": "DELIV_QTY", "datatype": {"base": "integer", "minimum": 0}, "dc:description": "Deliverable quantity; can be blank."},
+      {"name": "DELIV_PER", "titles": "DELIV_PER", "datatype": {"base": "decimal", "minimum": 0, "maximum": 100}, "dc:description": "Delivery percentage; can be blank."}
+    ]
+  }
+}

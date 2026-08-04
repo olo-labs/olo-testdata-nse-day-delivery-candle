@@ -1,0 +1,39 @@
+# NSE India Daily OHLC, Bhavcopy and Delivery Data
+
+> Date-partitioned CSV archive of NSE India daily security OHLC prices, bhavcopy trading statistics, volume, deliverable quantity, and delivery percentage from 30 September 2019 onward.
+
+Canonical repository: https://github.com/olo-labs/olo-testdata-nse-day-delivery-candle
+Data directory: Day_Delivery/NSE
+File pattern: Day_Delivery/NSE/delivery_DD-MMM-YYYY.csv
+Logical row key: DATE1 + SYMBOL + SERIES
+Source report: NSE Full Bhavcopy and Security Deliverable data
+
+## Primary documentation
+
+- README.md: Overview, quick start, layout, automation, licensing, and caveats.
+- docs/DATA_DICTIONARY.md: Definitions for all 15 CSV columns, units, and relationships.
+- docs/USAGE.md: Python, pandas, PowerShell, and DuckDB examples.
+- docs/DATA_QUALITY.md: Known issues, validation, and reporting requirements.
+- docs/FAQ.md: Direct answers to common NSE data questions.
+- CONTRIBUTING.md: Contribution and data-correction requirements.
+- metadata/dataset.jsonld: Schema.org Dataset metadata.
+- metadata/csvw.json: Machine-readable CSV column schema.
+- CITATION.cff: Citation metadata.
+
+## Core schema
+
+SYMBOL, SERIES, DATE1, PREV_CLOSE, OPEN_PRICE, HIGH_PRICE, LOW_PRICE, LAST_PRICE, CLOSE_PRICE, AVG_PRICE, TTL_TRD_QNTY, TURNOVER_LACS, NO_OF_TRADES, DELIV_QTY, DELIV_PER
+
+Daily candle: OPEN_PRICE, HIGH_PRICE, LOW_PRICE, CLOSE_PRICE.
+Delivery: DELIV_QTY is deliverable quantity; DELIV_PER is delivery percentage.
+Volume: TTL_TRD_QNTY is total traded quantity; TURNOVER_LACS is turnover in lakh rupees for INR-denominated instruments.
+
+## Important interpretation rules
+
+- Data is raw exchange-reported values, not corporate-action-adjusted prices.
+- Use DATE1 + SYMBOL + SERIES as the logical key.
+- LAST_PRICE can differ from official CLOSE_PRICE.
+- Not every calendar day has a report; special weekend sessions can exist.
+- Validate files before analysis; docs/DATA_QUALITY.md records a known malformed file.
+- Apache-2.0 covers project code/docs; underlying NSE data has separate rights and policies.
+- This independent repository is not affiliated with NSE and is not investment advice.

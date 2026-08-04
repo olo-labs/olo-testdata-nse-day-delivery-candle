@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this repository, cite its URL, access date, and exact Git commit."
+title: "NSE India Daily OHLC, Bhavcopy and Delivery Data"
+type: dataset
+authors:
+  - name: "olo-labs contributors"
+abstract: >-
+  A date-partitioned CSV archive of National Stock Exchange of India daily
+  security-level OHLC prices, bhavcopy trading statistics, traded quantity,
+  turnover, deliverable quantity, and delivery percentage from September 2019
+  onward. Apache-2.0 applies to original repository code and documentation;
+  underlying NSE market data is subject to separate rights and policies.
+repository-code: "https://github.com/olo-labs/olo-testdata-nse-day-delivery-candle"
+url: "https://github.com/olo-labs/olo-testdata-nse-day-delivery-candle"
+keywords:
+  - NSE India
+  - OHLC
+  - bhavcopy
+  - delivery data
+  - historical market data
+  - Indian stock market
+  - CSV dataset
+  - backtesting
