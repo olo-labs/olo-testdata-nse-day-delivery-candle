@@ -1,0 +1,479 @@
+name: Manual versioned NSE delivery release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example v1.0.0"
+        required: true
+        type: string
+
+      release_title:
+        description: "Optional release title"
+        required: false
+        default: ""
+        type: string
+
+      prerelease:
+        description: "Mark this as a pre-release"
+        required: true
+        default: false
+        type: boolean
+
+      make_latest:
+        description: "Mark this as the latest GitHub release"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nse-versioned-release
+  cancel-in-progress: false
+
+jobs:
+  create-versioned-release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_ZIP: Day_Delivery-${{ inputs.version }}.zip
+      RELEASE_NOTES: RELEASE_NOTES-${{ inputs.version }}.md
+      RELEASE_LICENSE: LICENSE
+
+    steps:
+      # ---------------------------------------------------------------
+      # Checkout
+      # ---------------------------------------------------------------
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ---------------------------------------------------------------
+      # Validate version
+      # Allows:
+      # v1.0.0
+      # v1.0.0-beta
+      # v1.0.0-rc.1
+      # ---------------------------------------------------------------
+      - name: Validate release version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $version = "${{ inputs.version }}".Trim()
+
+          if ($version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') {
+              throw @"
+          Invalid release version: $version
+
+          Valid examples:
+          - v1.0.0
+          - v1.2.3
+          - v2.0.0-beta
+          - v2.0.0-rc.1
+          "@
+          }
+
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+          "RELEASE_ZIP=Day_Delivery-$version.zip" >> $env:GITHUB_ENV
+          "RELEASE_NOTES=RELEASE_NOTES-$version.md" >> $env:GITHUB_ENV
+
+          Write-Host "Validated release version: $version"
+
+      # ---------------------------------------------------------------
+      # Prevent replacement of an existing versioned release/tag
+      # ---------------------------------------------------------------
+      - name: Ensure version does not already exist
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $version = $env:RELEASE_VERSION
+
+          # Check GitHub releases.
+          gh release view $version *> $null
+
+          if ($LASTEXITCODE -eq 0) {
+              throw "Release '$version' already exists. Use a new version number."
+          }
+
+          # Check Git tags separately.
+          git fetch --tags --force
+
+          $existingTag = git tag --list $version
+
+          if ($existingTag) {
+              throw "Git tag '$version' already exists. Use a new version number."
+          }
+
+          Write-Host "Version '$version' is available."
+
+      # ---------------------------------------------------------------
+      # Validate source folder
+      # ---------------------------------------------------------------
+      - name: Validate Day_Delivery folder
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Test-Path "Day_Delivery" -PathType Container)) {
+              throw "Day_Delivery folder does not exist."
+          }
+
+          $csvFiles = @(
+              Get-ChildItem `
+                  -Path "Day_Delivery" `
+                  -Filter "*.csv" `
+                  -File `
+                  -Recurse
+          )
+
+          if ($csvFiles.Count -eq 0) {
+              throw "No CSV files were found inside Day_Delivery."
+          }
+
+          $totalSize = (
+              $csvFiles |
+              Measure-Object -Property Length -Sum
+          ).Sum
+
+          $totalSizeMB = [Math]::Round($totalSize / 1MB, 2)
+
+          "CSV_FILE_COUNT=$($csvFiles.Count)" >> $env:GITHUB_ENV
+          "CSV_TOTAL_SIZE_MB=$totalSizeMB" >> $env:GITHUB_ENV
+
+          Write-Host "CSV files: $($csvFiles.Count)"
+          Write-Host "Uncompressed CSV size: $totalSizeMB MB"
+
+      # ---------------------------------------------------------------
+      # Locate and normalize license
+      # ---------------------------------------------------------------
+      - name: Prepare license
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $licenseCandidates = @(
+              "LICENSE",
+              "LICENSE.txt",
+              "LICENSE.md"
+          )
+
+          $sourceLicense = $licenseCandidates |
+              Where-Object {
+                  Test-Path $_ -PathType Leaf
+              } |
+              Select-Object -First 1
+
+          if (-not $sourceLicense) {
+              throw @"
+          No repository license file was found.
+
+          Add one of the following files:
+          - LICENSE
+          - LICENSE.txt
+          - LICENSE.md
+          "@
+          }
+
+          $sourceFullPath = (Resolve-Path $sourceLicense).Path
+          $targetFullPath = Join-Path $PWD "LICENSE"
+
+          if ($sourceFullPath -ne $targetFullPath) {
+              Copy-Item `
+                  -Path $sourceLicense `
+                  -Destination "LICENSE" `
+                  -Force
+          }
+
+          Write-Host "Using license file: $sourceLicense"
+
+      # ---------------------------------------------------------------
+      # Generate versioned release notes
+      # ---------------------------------------------------------------
+      - name: Generate release notes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $version = $env:RELEASE_VERSION
+          $releaseDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss 'UTC'"
+          $commitSha = git rev-parse HEAD
+          $shortSha = $commitSha.Substring(0, 7)
+
+          $latestCsv = Get-ChildItem `
+              -Path "Day_Delivery" `
+              -Filter "*.csv" `
+              -File `
+              -Recurse |
+              Sort-Object LastWriteTimeUtc -Descending |
+              Select-Object -First 1
+
+          $oldestCsv = Get-ChildItem `
+              -Path "Day_Delivery" `
+              -Filter "*.csv" `
+              -File `
+              -Recurse |
+              Sort-Object LastWriteTimeUtc |
+              Select-Object -First 1
+
+          $notes = @()
+          $notes += "# NSE Delivery Data $version"
+          $notes += ""
+          $notes += "Versioned archive of the NSE delivery dataset."
+          $notes += ""
+          $notes += "## Release information"
+          $notes += ""
+          $notes += "- Version: ``$version``"
+          $notes += "- Published: $releaseDate"
+          $notes += "- Source commit: ``$shortSha``"
+          $notes += "- CSV files: $env:CSV_FILE_COUNT"
+          $notes += "- Uncompressed CSV size: $env:CSV_TOTAL_SIZE_MB MB"
+          $notes += "- Archive: ``$env:RELEASE_ZIP``"
+          $notes += ""
+
+          if ($oldestCsv) {
+              $oldestRelativePath = $oldestCsv.FullName.Replace(
+                  "$PWD\",
+                  ""
+              )
+
+              $notes += "- Oldest file: ``$oldestRelativePath``"
+          }
+
+          if ($latestCsv) {
+              $latestRelativePath = $latestCsv.FullName.Replace(
+                  "$PWD\",
+                  ""
+              )
+
+              $notes += "- Newest file: ``$latestRelativePath``"
+          }
+
+          $notes += ""
+          $notes += "## Archive contents"
+          $notes += ""
+          $notes += "The archive contains the complete ``Day_Delivery``"
+          $notes += "directory available at source commit ``$shortSha``."
+          $notes += ""
+          $notes += "The release notes and license are also included"
+          $notes += "inside the ZIP archive."
+          $notes += ""
+          $notes += "## Integrity verification"
+          $notes += ""
+          $notes += "Verify the downloaded archive using the attached"
+          $notes += "``$env:RELEASE_ZIP.sha256`` checksum file."
+          $notes += ""
+          $notes += "## License"
+          $notes += ""
+          $notes += "See the included and attached ``LICENSE`` file."
+
+          $notes |
+              Set-Content `
+                  -Path $env:RELEASE_NOTES `
+                  -Encoding utf8
+
+          Write-Host "Generated $env:RELEASE_NOTES"
+          Get-Content $env:RELEASE_NOTES
+
+      # ---------------------------------------------------------------
+      # Stage the archive contents without modifying tracked files
+      # ---------------------------------------------------------------
+      - name: Prepare archive directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $stagingRoot = Join-Path $env:RUNNER_TEMP "release-package"
+          $stagingFolder = Join-Path $stagingRoot "Day_Delivery"
+
+          if (Test-Path $stagingRoot) {
+              Remove-Item `
+                  -Path $stagingRoot `
+                  -Recurse `
+                  -Force
+          }
+
+          New-Item `
+              -Path $stagingRoot `
+              -ItemType Directory `
+              -Force |
+              Out-Null
+
+          Copy-Item `
+              -Path "Day_Delivery" `
+              -Destination $stagingRoot `
+              -Recurse `
+              -Force
+
+          Copy-Item `
+              -Path $env:RELEASE_NOTES `
+              -Destination (Join-Path $stagingFolder "RELEASE_NOTES.md") `
+              -Force
+
+          Copy-Item `
+              -Path "LICENSE" `
+              -Destination (Join-Path $stagingFolder "LICENSE") `
+              -Force
+
+          "RELEASE_STAGING_ROOT=$stagingRoot" >> $env:GITHUB_ENV
+
+          Write-Host "Archive staging directory prepared."
+
+      # ---------------------------------------------------------------
+      # Create versioned ZIP
+      # ---------------------------------------------------------------
+      - name: Create versioned ZIP archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (Test-Path $env:RELEASE_ZIP) {
+              Remove-Item $env:RELEASE_ZIP -Force
+          }
+
+          $folderToZip = Join-Path `
+              $env:RELEASE_STAGING_ROOT `
+              "Day_Delivery"
+
+          Compress-Archive `
+              -Path $folderToZip `
+              -DestinationPath $env:RELEASE_ZIP `
+              -CompressionLevel Optimal `
+              -Force
+
+          $archive = Get-Item $env:RELEASE_ZIP
+
+          if ($archive.Length -le 0) {
+              throw "The generated ZIP archive is empty."
+          }
+
+          $archiveSizeMB = [Math]::Round(
+              $archive.Length / 1MB,
+              2
+          )
+
+          "ARCHIVE_SIZE_MB=$archiveSizeMB" >> $env:GITHUB_ENV
+
+          Write-Host "Created archive: $($archive.Name)"
+          Write-Host "Compressed size: $archiveSizeMB MB"
+
+      # ---------------------------------------------------------------
+      # Generate SHA-256 checksum
+      # ---------------------------------------------------------------
+      - name: Generate SHA-256 checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $hash = Get-FileHash `
+              -Path $env:RELEASE_ZIP `
+              -Algorithm SHA256
+
+          $checksumFile = "$env:RELEASE_ZIP.sha256"
+          $checksumLine = "$($hash.Hash.ToLower())  $env:RELEASE_ZIP"
+
+          $checksumLine |
+              Set-Content `
+                  -Path $checksumFile `
+                  -Encoding ascii
+
+          Write-Host $checksumLine
+
+      # ---------------------------------------------------------------
+      # Determine release title
+      # ---------------------------------------------------------------
+      - name: Determine release title
+        shell: pwsh
+        run: |
+          $requestedTitle = "${{ inputs.release_title }}".Trim()
+
+          if ([string]::IsNullOrWhiteSpace($requestedTitle)) {
+              $releaseTitle = "NSE Delivery Data $env:RELEASE_VERSION"
+          }
+          else {
+              $releaseTitle = $requestedTitle
+          }
+
+          "FINAL_RELEASE_TITLE=$releaseTitle" >> $env:GITHUB_ENV
+
+          Write-Host "Release title: $releaseTitle"
+
+      # ---------------------------------------------------------------
+      # Create immutable versioned release
+      # ---------------------------------------------------------------
+      - name: Publish versioned GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $arguments = @(
+              "release",
+              "create",
+              $env:RELEASE_VERSION,
+              "$env:RELEASE_ZIP#NSE delivery data $env:RELEASE_VERSION",
+              "$env:RELEASE_ZIP.sha256#SHA-256 checksum",
+              "$env:RELEASE_NOTES#Release notes",
+              "LICENSE#License",
+              "--title",
+              $env:FINAL_RELEASE_TITLE,
+              "--notes-file",
+              $env:RELEASE_NOTES,
+              "--target",
+              "${{ github.sha }}",
+              "--verify-tag"
+          )
+
+          if ("${{ inputs.prerelease }}" -eq "true") {
+              $arguments += "--prerelease"
+          }
+
+          if ("${{ inputs.make_latest }}" -eq "true") {
+              $arguments += "--latest"
+          }
+          else {
+              $arguments += "--latest=false"
+          }
+
+          Write-Host "Publishing release $env:RELEASE_VERSION"
+
+          & gh @arguments
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "GitHub release publishing failed."
+          }
+
+          Write-Host "Release published successfully."
+
+      # ---------------------------------------------------------------
+      # Workflow summary
+      # ---------------------------------------------------------------
+      - name: Write workflow summary
+        if: success()
+        shell: pwsh
+        run: |
+          $repository = "${{ github.repository }}"
+          $version = $env:RELEASE_VERSION
+
+          @"
+          ## Versioned NSE Delivery Release Published
+
+          - **Version:** ``$version``
+          - **Title:** $env:FINAL_RELEASE_TITLE
+          - **CSV files:** $env:CSV_FILE_COUNT
+          - **Archive:** ``$env:RELEASE_ZIP``
+          - **Archive size:** $env:ARCHIVE_SIZE_MB MB
+          - **Checksum:** ``$env:RELEASE_ZIP.sha256``
+          - **Pre-release:** ${{ inputs.prerelease }}
+          - **Latest release:** ${{ inputs.make_latest }}
+          - **Release:** https://github.com/$repository/releases/tag/$version
+          "@ >> $env:GITHUB_STEP_SUMMARY
