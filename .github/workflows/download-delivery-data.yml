@@ -18,7 +18,7 @@ on:
 
     # Runs at 15:37 and 16:37 IST.
     # 10:07 and 11:07 UTC respectively.
-    - cron: "7 10,11 * * 1-5"
+    #- cron: "7 10,11 * * 1-5"
 
 permissions:
   contents: write
