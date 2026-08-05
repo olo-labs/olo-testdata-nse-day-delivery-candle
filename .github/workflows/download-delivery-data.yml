@@ -2,6 +2,12 @@ name: Download NSE delivery data
 
 on:
   workflow_dispatch:
+    inputs:
+      force_release:
+        description: Rebuild the rolling release even when no new CSV was downloaded
+        required: false
+        default: false
+        type: boolean
 
   schedule:
     # GitHub Actions cron uses UTC.
@@ -71,9 +77,14 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
               Write-Host "No new delivery CSV files were downloaded."
 
+              $currentSha = (git rev-parse HEAD).Trim()
+
               "has_changes=false" >> $env:GITHUB_OUTPUT
-              "commit_sha=" >> $env:GITHUB_OUTPUT
+              "commit_sha=$currentSha" >> $env:GITHUB_OUTPUT
               "file_count=0" >> $env:GITHUB_OUTPUT
+
+              $downloadedFilesPath = Join-Path $env:RUNNER_TEMP "downloaded-files.txt"
+              Set-Content -Path $downloadedFilesPath -Value @() -Encoding utf8
 
               exit 0
           }
@@ -93,9 +104,14 @@ jobs:
 
               git reset
 
+              $currentSha = (git rev-parse HEAD).Trim()
+
               "has_changes=false" >> $env:GITHUB_OUTPUT
-              "commit_sha=" >> $env:GITHUB_OUTPUT
+              "commit_sha=$currentSha" >> $env:GITHUB_OUTPUT
               "file_count=0" >> $env:GITHUB_OUTPUT
+
+              $downloadedFilesPath = Join-Path $env:RUNNER_TEMP "downloaded-files.txt"
+              Set-Content -Path $downloadedFilesPath -Value @() -Encoding utf8
 
               exit 0
           }
@@ -149,12 +165,51 @@ jobs:
           Write-Host "Commit: $commitSha"
 
       # ---------------------------------------------------------------
+      # Decide whether a rolling release should be published
+      # ---------------------------------------------------------------
+      - name: Determine rolling release action
+        id: release_decision
+        shell: pwsh
+        env:
+          HAS_CHANGES: ${{ steps.commit_data.outputs.has_changes }}
+          FORCE_RELEASE: ${{ inputs.force_release || 'false' }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_SHA: ${{ steps.commit_data.outputs.commit_sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $hasChanges = $env:HAS_CHANGES -eq "true"
+          $forceRelease = (
+              $env:EVENT_NAME -eq "workflow_dispatch" -and
+              $env:FORCE_RELEASE -eq "true"
+          )
+
+          if ($hasChanges) {
+              Write-Host "New delivery data was committed; publishing the rolling release."
+              "publish_release=true" >> $env:GITHUB_OUTPUT
+              "release_mode=new-data" >> $env:GITHUB_OUTPUT
+          }
+          elseif ($forceRelease) {
+              Write-Host "Forced rolling-release rebuild requested."
+              "publish_release=true" >> $env:GITHUB_OUTPUT
+              "release_mode=forced" >> $env:GITHUB_OUTPUT
+          }
+          else {
+              Write-Host "No new files and force_release is false."
+              Write-Host "Finishing successfully without modifying the release."
+              "publish_release=false" >> $env:GITHUB_OUTPUT
+              "release_mode=skipped" >> $env:GITHUB_OUTPUT
+          }
+
+          "target_commit=$env:COMMIT_SHA" >> $env:GITHUB_OUTPUT
+
+      # ---------------------------------------------------------------
       # Generate rolling release notes
       #
       # Runs only when one or more new delivery files were committed.
       # ---------------------------------------------------------------
       - name: Generate latest release notes
-        if: steps.commit_data.outputs.has_changes == 'true'
+        if: steps.release_decision.outputs.publish_release == 'true'
         shell: pwsh
         env:
           COMMIT_SHA: ${{ steps.commit_data.outputs.commit_sha }}
@@ -183,7 +238,9 @@ jobs:
               }
           )
 
-          if ($downloadedFiles.Count -eq 0) {
+          $releaseMode = "${{ steps.release_decision.outputs.release_mode }}"
+
+          if ($downloadedFiles.Count -eq 0 -and $releaseMode -ne "forced") {
               throw "No downloaded files were available for release notes."
           }
 
@@ -224,12 +281,17 @@ jobs:
               $shortCommit = $commitSha
           }
 
-          $newFileList = (
-              $downloadedFiles |
-              ForEach-Object {
-                  "- ``$_``"
-              }
-          ) -join [Environment]::NewLine
+          if ($downloadedFiles.Count -gt 0) {
+              $newFileList = (
+                  $downloadedFiles |
+                  ForEach-Object {
+                      "- ``$_``"
+                  }
+              ) -join [Environment]::NewLine
+          }
+          else {
+              $newFileList = "- No new CSV files; rolling release rebuilt from the current repository state."
+          }
 
           $utcNow = (Get-Date).ToUniversalTime()
 
@@ -279,7 +341,7 @@ jobs:
       # Locate and normalize repository license
       # ---------------------------------------------------------------
       - name: Prepare license asset
-        if: steps.commit_data.outputs.has_changes == 'true'
+        if: steps.release_decision.outputs.publish_release == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -337,7 +399,7 @@ jobs:
       # modifying the repository's tracked Day_Delivery directory.
       # ---------------------------------------------------------------
       - name: Prepare release package
-        if: steps.commit_data.outputs.has_changes == 'true'
+        if: steps.release_decision.outputs.publish_release == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -413,7 +475,7 @@ jobs:
       # Create complete rolling ZIP archive
       # ---------------------------------------------------------------
       - name: Create Day_Delivery ZIP archive
-        if: steps.commit_data.outputs.has_changes == 'true'
+        if: steps.release_decision.outputs.publish_release == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -455,7 +517,7 @@ jobs:
       # Generate SHA-256 checksum
       # ---------------------------------------------------------------
       - name: Generate archive checksum
-        if: steps.commit_data.outputs.has_changes == 'true'
+        if: steps.release_decision.outputs.publish_release == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -489,7 +551,7 @@ jobs:
       # ---------------------------------------------------------------
       - name: Detect existing rolling release
         id: release_state
-        if: steps.commit_data.outputs.has_changes == 'true'
+        if: steps.release_decision.outputs.publish_release == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -539,10 +601,10 @@ jobs:
       # The rolling tag always points to the latest committed dataset.
       # ---------------------------------------------------------------
       - name: Update rolling release tag
-        if: steps.commit_data.outputs.has_changes == 'true'
+        if: steps.release_decision.outputs.publish_release == 'true'
         shell: pwsh
         env:
-          TARGET_COMMIT: ${{ steps.commit_data.outputs.commit_sha }}
+          TARGET_COMMIT: ${{ steps.release_decision.outputs.target_commit }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -582,7 +644,7 @@ jobs:
       # ---------------------------------------------------------------
       - name: Create rolling release
         if: >-
-          steps.commit_data.outputs.has_changes == 'true' &&
+          steps.release_decision.outputs.publish_release == 'true' &&
           steps.release_state.outputs.release_exists == 'false'
         shell: pwsh
         env:
@@ -612,7 +674,7 @@ jobs:
       # ---------------------------------------------------------------
       - name: Update rolling release metadata
         if: >-
-          steps.commit_data.outputs.has_changes == 'true' &&
+          steps.release_decision.outputs.publish_release == 'true' &&
           steps.release_state.outputs.release_exists == 'true'
         shell: pwsh
         env:
@@ -637,7 +699,7 @@ jobs:
       # ---------------------------------------------------------------
       - name: Replace rolling release assets
         if: >-
-          steps.commit_data.outputs.has_changes == 'true' &&
+          steps.release_decision.outputs.publish_release == 'true' &&
           steps.release_state.outputs.release_exists == 'true'
         shell: pwsh
         env:
@@ -663,7 +725,7 @@ jobs:
       # Verify release and expected assets
       # ---------------------------------------------------------------
       - name: Verify rolling release
-        if: steps.commit_data.outputs.has_changes == 'true'
+        if: steps.release_decision.outputs.publish_release == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -726,14 +788,17 @@ jobs:
           HAS_CHANGES: ${{ steps.commit_data.outputs.has_changes }}
           FILE_COUNT: ${{ steps.commit_data.outputs.file_count }}
           COMMIT_SHA: ${{ steps.commit_data.outputs.commit_sha }}
+          PUBLISH_RELEASE: ${{ steps.release_decision.outputs.publish_release }}
+          RELEASE_MODE: ${{ steps.release_decision.outputs.release_mode }}
         run: |
-          if ($env:HAS_CHANGES -ne "true") {
+          if ($env:PUBLISH_RELEASE -ne "true") {
               @"
           ## NSE Delivery Data
 
           No new delivery CSV files were found.
 
-          The existing rolling release was not modified.
+          The workflow completed successfully and the rolling release was not modified.
+          To rebuild it manually, run the workflow with **force_release=true**.
           "@ >> $env:GITHUB_STEP_SUMMARY
 
               exit 0
@@ -746,7 +811,7 @@ jobs:
           }
 
           @"
-          ## NSE Delivery Data Published
+          ## NSE Delivery Data Published`n`n          - **Release mode:** $env:RELEASE_MODE
 
           - **New CSV files:** $env:FILE_COUNT
           - **Total CSV files:** $env:TOTAL_CSV_FILE_COUNT
