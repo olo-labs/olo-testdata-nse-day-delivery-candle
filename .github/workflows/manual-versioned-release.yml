@@ -15,7 +15,7 @@ on:
         type: string
 
       prerelease:
-        description: "Mark this as a pre-release"
+        description: "Mark this release as a pre-release"
         required: true
         default: false
         type: boolean
@@ -30,18 +30,16 @@ permissions:
   contents: write
 
 concurrency:
-  group: nse-versioned-release
+  group: nse-versioned-release-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
-  create-versioned-release:
+  create-or-update-versioned-release:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     env:
-      RELEASE_VERSION: ${{ inputs.version }}
-      RELEASE_ZIP: Day_Delivery-${{ inputs.version }}.zip
-      RELEASE_NOTES: RELEASE_NOTES-${{ inputs.version }}.md
+      RELEASE_TEMPLATE: .github/release-notes/template.md
       RELEASE_LICENSE: LICENSE
 
     steps:
@@ -54,20 +52,27 @@ jobs:
           fetch-depth: 0
 
       # ---------------------------------------------------------------
-      # Validate version
-      # Allows:
+      # Validate and normalize version
+      #
+      # Supported examples:
       # v1.0.0
-      # v1.0.0-beta
-      # v1.0.0-rc.1
+      # v1.2.3
+      # v2.0.0-beta
+      # v2.0.0-rc.1
       # ---------------------------------------------------------------
       - name: Validate release version
         shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $version = "${{ inputs.version }}".Trim()
+          $version = $env:INPUT_VERSION.Trim()
 
-          if ($version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') {
+          if (
+              $version -notmatch
+              '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$'
+          ) {
               throw @"
           Invalid release version: $version
 
@@ -79,16 +84,44 @@ jobs:
           "@
           }
 
+          $releaseZip = "Day_Delivery-$version.zip"
+          $releaseNotes = "RELEASE_NOTES-$version.md"
+          $checksumFile = "$releaseZip.sha256"
+
           "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
-          "RELEASE_ZIP=Day_Delivery-$version.zip" >> $env:GITHUB_ENV
-          "RELEASE_NOTES=RELEASE_NOTES-$version.md" >> $env:GITHUB_ENV
+          "RELEASE_ZIP=$releaseZip" >> $env:GITHUB_ENV
+          "RELEASE_NOTES=$releaseNotes" >> $env:GITHUB_ENV
+          "CHECKSUM_FILE=$checksumFile" >> $env:GITHUB_ENV
 
-          Write-Host "Validated release version: $version"
+          Write-Host "Version: $version"
+          Write-Host "Archive: $releaseZip"
+          Write-Host "Release notes: $releaseNotes"
+          Write-Host "Checksum: $checksumFile"
 
       # ---------------------------------------------------------------
-      # Prevent replacement of an existing versioned release/tag
+      # Update local tags before checking release/tag state
       # ---------------------------------------------------------------
-      - name: Ensure version does not already exist
+      - name: Fetch Git tags
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          git fetch origin `
+              --tags `
+              --force `
+              --prune
+
+      # ---------------------------------------------------------------
+      # Check whether the release and tag already exist
+      #
+      # Existing release:
+      #   update notes/title and overwrite matching assets
+      #
+      # Missing release:
+      #   create release and upload assets
+      # ---------------------------------------------------------------
+      - name: Detect existing release and tag
+        id: release_state
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -97,39 +130,65 @@ jobs:
 
           $version = $env:RELEASE_VERSION
 
-          # Check GitHub releases.
-          gh release view $version *> $null
+          gh release view $version `
+              --json tagName `
+              *> $null
 
           if ($LASTEXITCODE -eq 0) {
-              throw "Release '$version' already exists. Use a new version number."
+              $releaseExists = "true"
+              Write-Host "Release '$version' already exists."
+          }
+          else {
+              $releaseExists = "false"
+              Write-Host "Release '$version' does not exist."
           }
 
-          # Check Git tags separately.
-          git fetch --tags --force
+          $localTag = git tag `
+              --list $version
 
-          $existingTag = git tag --list $version
+          $remoteTag = git ls-remote `
+              --tags `
+              origin `
+              "refs/tags/$version"
 
-          if ($existingTag) {
-              throw "Git tag '$version' already exists. Use a new version number."
+          if (
+              -not [string]::IsNullOrWhiteSpace($localTag) -or
+              -not [string]::IsNullOrWhiteSpace($remoteTag)
+          ) {
+              $tagExists = "true"
+              Write-Host "Git tag '$version' already exists."
+          }
+          else {
+              $tagExists = "false"
+              Write-Host "Git tag '$version' does not exist."
           }
 
-          Write-Host "Version '$version' is available."
+          "release_exists=$releaseExists" >> $env:GITHUB_OUTPUT
+          "tag_exists=$tagExists" >> $env:GITHUB_OUTPUT
 
       # ---------------------------------------------------------------
-      # Validate source folder
+      # Validate source data
       # ---------------------------------------------------------------
-      - name: Validate Day_Delivery folder
+      - name: Validate Day_Delivery dataset
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          if (-not (Test-Path "Day_Delivery" -PathType Container)) {
-              throw "Day_Delivery folder does not exist."
+          $sourceDirectory = "Day_Delivery"
+
+          if (
+              -not (
+                  Test-Path `
+                      -Path $sourceDirectory `
+                      -PathType Container
+              )
+          ) {
+              throw "Directory does not exist: $sourceDirectory"
           }
 
           $csvFiles = @(
               Get-ChildItem `
-                  -Path "Day_Delivery" `
+                  -Path $sourceDirectory `
                   -Filter "*.csv" `
                   -File `
                   -Recurse
@@ -139,21 +198,59 @@ jobs:
               throw "No CSV files were found inside Day_Delivery."
           }
 
-          $totalSize = (
+          $totalBytes = (
               $csvFiles |
-              Measure-Object -Property Length -Sum
+              Measure-Object `
+                  -Property Length `
+                  -Sum
           ).Sum
 
-          $totalSizeMB = [Math]::Round($totalSize / 1MB, 2)
+          $totalSizeMB = [Math]::Round(
+              $totalBytes / 1MB,
+              2
+          )
+
+          $oldestFile = $csvFiles |
+              Sort-Object Name |
+              Select-Object -First 1
+
+          $newestFile = $csvFiles |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
 
           "CSV_FILE_COUNT=$($csvFiles.Count)" >> $env:GITHUB_ENV
           "CSV_TOTAL_SIZE_MB=$totalSizeMB" >> $env:GITHUB_ENV
 
+          if ($oldestFile) {
+              $oldestRelativePath = [IO.Path]::GetRelativePath(
+                  $PWD.Path,
+                  $oldestFile.FullName
+              )
+
+              "OLDEST_CSV_FILE=$oldestRelativePath" >> $env:GITHUB_ENV
+          }
+
+          if ($newestFile) {
+              $newestRelativePath = [IO.Path]::GetRelativePath(
+                  $PWD.Path,
+                  $newestFile.FullName
+              )
+
+              "NEWEST_CSV_FILE=$newestRelativePath" >> $env:GITHUB_ENV
+          }
+
           Write-Host "CSV files: $($csvFiles.Count)"
           Write-Host "Uncompressed CSV size: $totalSizeMB MB"
+          Write-Host "Oldest file: $oldestRelativePath"
+          Write-Host "Newest file: $newestRelativePath"
 
       # ---------------------------------------------------------------
-      # Locate and normalize license
+      # Locate and normalize the repository license
+      #
+      # Supported repository filenames:
+      # LICENSE
+      # LICENSE.txt
+      # LICENSE.md
       # ---------------------------------------------------------------
       - name: Prepare license
         shell: pwsh
@@ -168,7 +265,9 @@ jobs:
 
           $sourceLicense = $licenseCandidates |
               Where-Object {
-                  Test-Path $_ -PathType Leaf
+                  Test-Path `
+                      -Path $_ `
+                      -PathType Leaf
               } |
               Select-Object -First 1
 
@@ -176,123 +275,155 @@ jobs:
               throw @"
           No repository license file was found.
 
-          Add one of the following files:
+          Add one of these files to the repository root:
           - LICENSE
           - LICENSE.txt
           - LICENSE.md
           "@
           }
 
-          $sourceFullPath = (Resolve-Path $sourceLicense).Path
-          $targetFullPath = Join-Path $PWD "LICENSE"
+          $sourceFullPath = (
+              Resolve-Path $sourceLicense
+          ).Path
+
+          $targetFullPath = Join-Path `
+              $PWD.Path `
+              $env:RELEASE_LICENSE
 
           if ($sourceFullPath -ne $targetFullPath) {
               Copy-Item `
                   -Path $sourceLicense `
-                  -Destination "LICENSE" `
+                  -Destination $env:RELEASE_LICENSE `
                   -Force
           }
 
-          Write-Host "Using license file: $sourceLicense"
+          if (
+              -not (
+                  Test-Path `
+                      -Path $env:RELEASE_LICENSE `
+                      -PathType Leaf
+              )
+          ) {
+              throw "Failed to prepare the LICENSE release asset."
+          }
+
+          Write-Host "Using license: $sourceLicense"
 
       # ---------------------------------------------------------------
-      # Generate versioned release notes
+      # Generate release notes from repository template
+      #
+      # Required file:
+      # .github/release-notes/template.md
+      #
+      # Supported placeholders:
+      # {{VERSION}}
+      # {{DATE}}
+      # {{DATETIME}}
+      # {{COMMIT}}
+      # {{SHORT_COMMIT}}
+      # {{CSV_FILE_COUNT}}
+      # {{CSV_TOTAL_SIZE_MB}}
+      # {{OLDEST_CSV_FILE}}
+      # {{NEWEST_CSV_FILE}}
+      # {{ARCHIVE_NAME}}
       # ---------------------------------------------------------------
       - name: Generate release notes
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $version = $env:RELEASE_VERSION
-          $releaseDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss 'UTC'"
-          $commitSha = git rev-parse HEAD
-          $shortSha = $commitSha.Substring(0, 7)
+          $templatePath = $env:RELEASE_TEMPLATE
 
-          $latestCsv = Get-ChildItem `
-              -Path "Day_Delivery" `
-              -Filter "*.csv" `
-              -File `
-              -Recurse |
-              Sort-Object LastWriteTimeUtc -Descending |
-              Select-Object -First 1
-
-          $oldestCsv = Get-ChildItem `
-              -Path "Day_Delivery" `
-              -Filter "*.csv" `
-              -File `
-              -Recurse |
-              Sort-Object LastWriteTimeUtc |
-              Select-Object -First 1
-
-          $notes = @()
-          $notes += "# NSE Delivery Data $version"
-          $notes += ""
-          $notes += "Versioned archive of the NSE delivery dataset."
-          $notes += ""
-          $notes += "## Release information"
-          $notes += ""
-          $notes += "- Version: ``$version``"
-          $notes += "- Published: $releaseDate"
-          $notes += "- Source commit: ``$shortSha``"
-          $notes += "- CSV files: $env:CSV_FILE_COUNT"
-          $notes += "- Uncompressed CSV size: $env:CSV_TOTAL_SIZE_MB MB"
-          $notes += "- Archive: ``$env:RELEASE_ZIP``"
-          $notes += ""
-
-          if ($oldestCsv) {
-              $oldestRelativePath = $oldestCsv.FullName.Replace(
-                  "$PWD\",
-                  ""
+          if (
+              -not (
+                  Test-Path `
+                      -Path $templatePath `
+                      -PathType Leaf
               )
+          ) {
+              throw @"
+          Release-note template was not found:
 
-              $notes += "- Oldest file: ``$oldestRelativePath``"
+          $templatePath
+
+          Create it in the repository before running this workflow.
+          "@
           }
 
-          if ($latestCsv) {
-              $latestRelativePath = $latestCsv.FullName.Replace(
-                  "$PWD\",
-                  ""
-              )
+          $commitSha = (
+              git rev-parse HEAD
+          ).Trim()
 
-              $notes += "- Newest file: ``$latestRelativePath``"
+          $shortCommit = (
+              git rev-parse --short=7 HEAD
+          ).Trim()
+
+          $releaseDate = Get-Date `
+              -Format "yyyy-MM-dd"
+
+          $releaseDateTime = Get-Date `
+              -Format "yyyy-MM-dd HH:mm:ss 'UTC'"
+
+          $content = Get-Content `
+              -Path $templatePath `
+              -Raw
+
+          $replacements = [ordered]@{
+              "{{VERSION}}"          = $env:RELEASE_VERSION
+              "{{DATE}}"             = $releaseDate
+              "{{DATETIME}}"         = $releaseDateTime
+              "{{COMMIT}}"           = $commitSha
+              "{{SHORT_COMMIT}}"     = $shortCommit
+              "{{CSV_FILE_COUNT}}"   = $env:CSV_FILE_COUNT
+              "{{CSV_TOTAL_SIZE_MB}}" = $env:CSV_TOTAL_SIZE_MB
+              "{{OLDEST_CSV_FILE}}"  = $env:OLDEST_CSV_FILE
+              "{{NEWEST_CSV_FILE}}"  = $env:NEWEST_CSV_FILE
+              "{{ARCHIVE_NAME}}"     = $env:RELEASE_ZIP
           }
 
-          $notes += ""
-          $notes += "## Archive contents"
-          $notes += ""
-          $notes += "The archive contains the complete ``Day_Delivery``"
-          $notes += "directory available at source commit ``$shortSha``."
-          $notes += ""
-          $notes += "The release notes and license are also included"
-          $notes += "inside the ZIP archive."
-          $notes += ""
-          $notes += "## Integrity verification"
-          $notes += ""
-          $notes += "Verify the downloaded archive using the attached"
-          $notes += "``$env:RELEASE_ZIP.sha256`` checksum file."
-          $notes += ""
-          $notes += "## License"
-          $notes += ""
-          $notes += "See the included and attached ``LICENSE`` file."
+          foreach ($placeholder in $replacements.Keys) {
+              $content = $content.Replace(
+                  $placeholder,
+                  $replacements[$placeholder]
+              )
+          }
 
-          $notes |
-              Set-Content `
-                  -Path $env:RELEASE_NOTES `
-                  -Encoding utf8
+          Set-Content `
+              -Path $env:RELEASE_NOTES `
+              -Value $content `
+              -Encoding utf8
 
-          Write-Host "Generated $env:RELEASE_NOTES"
+          if (
+              -not (
+                  Test-Path `
+                      -Path $env:RELEASE_NOTES `
+                      -PathType Leaf
+              )
+          ) {
+              throw "Failed to generate release notes."
+          }
+
+          Write-Host "Generated: $env:RELEASE_NOTES"
           Get-Content $env:RELEASE_NOTES
 
       # ---------------------------------------------------------------
-      # Stage the archive contents without modifying tracked files
+      # Prepare an isolated staging directory
+      #
+      # This prevents release-only LICENSE and RELEASE_NOTES files from
+      # modifying the tracked Day_Delivery directory in the workspace.
       # ---------------------------------------------------------------
-      - name: Prepare archive directory
+      - name: Prepare release package
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $stagingRoot = Join-Path $env:RUNNER_TEMP "release-package"
-          $stagingFolder = Join-Path $stagingRoot "Day_Delivery"
+          $stagingRoot = Join-Path `
+              $env:RUNNER_TEMP `
+              "nse-versioned-release"
+
+          $stagingFolder = Join-Path `
+              $stagingRoot `
+              "Day_Delivery"
 
           if (Test-Path $stagingRoot) {
               Remove-Item `
@@ -313,22 +444,47 @@ jobs:
               -Recurse `
               -Force
 
+          if (
+              -not (
+                  Test-Path `
+                      -Path $stagingFolder `
+                      -PathType Container
+              )
+          ) {
+              throw "Failed to copy Day_Delivery into staging."
+          }
+
           Copy-Item `
               -Path $env:RELEASE_NOTES `
-              -Destination (Join-Path $stagingFolder "RELEASE_NOTES.md") `
+              -Destination (
+                  Join-Path `
+                      $stagingFolder `
+                      "RELEASE_NOTES.md"
+              ) `
               -Force
 
           Copy-Item `
-              -Path "LICENSE" `
-              -Destination (Join-Path $stagingFolder "LICENSE") `
+              -Path $env:RELEASE_LICENSE `
+              -Destination (
+                  Join-Path `
+                      $stagingFolder `
+                      "LICENSE"
+              ) `
               -Force
 
           "RELEASE_STAGING_ROOT=$stagingRoot" >> $env:GITHUB_ENV
+          "RELEASE_STAGING_FOLDER=$stagingFolder" >> $env:GITHUB_ENV
 
-          Write-Host "Archive staging directory prepared."
+          Write-Host "Release staging directory prepared:"
+          Write-Host $stagingFolder
 
       # ---------------------------------------------------------------
       # Create versioned ZIP
+      #
+      # Result:
+      # Day_Delivery-v1.0.0.zip
+      #
+      # The archive contains a top-level Day_Delivery directory.
       # ---------------------------------------------------------------
       - name: Create versioned ZIP archive
         shell: pwsh
@@ -336,23 +492,31 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           if (Test-Path $env:RELEASE_ZIP) {
-              Remove-Item $env:RELEASE_ZIP -Force
+              Remove-Item `
+                  -Path $env:RELEASE_ZIP `
+                  -Force
           }
 
-          $folderToZip = Join-Path `
-              $env:RELEASE_STAGING_ROOT `
-              "Day_Delivery"
-
           Compress-Archive `
-              -Path $folderToZip `
+              -Path $env:RELEASE_STAGING_FOLDER `
               -DestinationPath $env:RELEASE_ZIP `
               -CompressionLevel Optimal `
               -Force
 
+          if (
+              -not (
+                  Test-Path `
+                      -Path $env:RELEASE_ZIP `
+                      -PathType Leaf
+              )
+          ) {
+              throw "ZIP archive was not created."
+          }
+
           $archive = Get-Item $env:RELEASE_ZIP
 
           if ($archive.Length -le 0) {
-              throw "The generated ZIP archive is empty."
+              throw "Generated ZIP archive is empty."
           }
 
           $archiveSizeMB = [Math]::Round(
@@ -363,7 +527,7 @@ jobs:
           "ARCHIVE_SIZE_MB=$archiveSizeMB" >> $env:GITHUB_ENV
 
           Write-Host "Created archive: $($archive.Name)"
-          Write-Host "Compressed size: $archiveSizeMB MB"
+          Write-Host "Archive size: $archiveSizeMB MB"
 
       # ---------------------------------------------------------------
       # Generate SHA-256 checksum
@@ -377,13 +541,25 @@ jobs:
               -Path $env:RELEASE_ZIP `
               -Algorithm SHA256
 
-          $checksumFile = "$env:RELEASE_ZIP.sha256"
-          $checksumLine = "$($hash.Hash.ToLower())  $env:RELEASE_ZIP"
+          $checksumLine = @(
+              $hash.Hash.ToLower()
+              $env:RELEASE_ZIP
+          ) -join "  "
 
-          $checksumLine |
-              Set-Content `
-                  -Path $checksumFile `
-                  -Encoding ascii
+          Set-Content `
+              -Path $env:CHECKSUM_FILE `
+              -Value $checksumLine `
+              -Encoding ascii
+
+          if (
+              -not (
+                  Test-Path `
+                      -Path $env:CHECKSUM_FILE `
+                      -PathType Leaf
+              )
+          ) {
+              throw "Checksum file was not generated."
+          }
 
           Write-Host $checksumLine
 
@@ -392,11 +568,22 @@ jobs:
       # ---------------------------------------------------------------
       - name: Determine release title
         shell: pwsh
+        env:
+          INPUT_RELEASE_TITLE: ${{ inputs.release_title }}
         run: |
-          $requestedTitle = "${{ inputs.release_title }}".Trim()
+          $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($requestedTitle)) {
-              $releaseTitle = "NSE Delivery Data $env:RELEASE_VERSION"
+          $requestedTitle = $env:INPUT_RELEASE_TITLE.Trim()
+
+          if (
+              [string]::IsNullOrWhiteSpace(
+                  $requestedTitle
+              )
+          ) {
+              $releaseTitle = (
+                  "NSE Delivery Data " +
+                  $env:RELEASE_VERSION
+              )
           }
           else {
               $releaseTitle = $requestedTitle
@@ -407,12 +594,19 @@ jobs:
           Write-Host "Release title: $releaseTitle"
 
       # ---------------------------------------------------------------
-      # Create immutable versioned release
+      # Create a missing release
+      #
+      # If the Git tag is missing, gh release create creates the tag
+      # using the supplied target commit.
       # ---------------------------------------------------------------
-      - name: Publish versioned GitHub release
+      - name: Create new versioned GitHub release
+        if: steps.release_state.outputs.release_exists == 'false'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          INPUT_MAKE_LATEST: ${{ inputs.make_latest }}
+          TARGET_COMMIT: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -421,38 +615,191 @@ jobs:
               "create",
               $env:RELEASE_VERSION,
               "$env:RELEASE_ZIP#NSE delivery data $env:RELEASE_VERSION",
-              "$env:RELEASE_ZIP.sha256#SHA-256 checksum",
+              "$env:CHECKSUM_FILE#SHA-256 checksum",
               "$env:RELEASE_NOTES#Release notes",
-              "LICENSE#License",
+              "$env:RELEASE_LICENSE#License",
               "--title",
               $env:FINAL_RELEASE_TITLE,
               "--notes-file",
               $env:RELEASE_NOTES,
               "--target",
-              "${{ github.sha }}",
-              "--verify-tag"
+              $env:TARGET_COMMIT
           )
 
-          if ("${{ inputs.prerelease }}" -eq "true") {
+          if ($env:INPUT_PRERELEASE -eq "true") {
               $arguments += "--prerelease"
           }
 
-          if ("${{ inputs.make_latest }}" -eq "true") {
+          if (
+              $env:INPUT_MAKE_LATEST -eq "true" -and
+              $env:INPUT_PRERELEASE -ne "true"
+          ) {
               $arguments += "--latest"
           }
           else {
               $arguments += "--latest=false"
           }
 
-          Write-Host "Publishing release $env:RELEASE_VERSION"
+          Write-Host "Creating release $env:RELEASE_VERSION"
 
           & gh @arguments
 
           if ($LASTEXITCODE -ne 0) {
-              throw "GitHub release publishing failed."
+              throw "GitHub release creation failed."
           }
 
-          Write-Host "Release published successfully."
+          Write-Host "Release created successfully."
+
+      # ---------------------------------------------------------------
+      # Update an existing release
+      #
+      # This updates:
+      # - title
+      # - release body
+      # - prerelease state
+      # - latest-release state
+      #
+      # It does not create a new tag.
+      # ---------------------------------------------------------------
+      - name: Update existing GitHub release
+        if: steps.release_state.outputs.release_exists == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          INPUT_MAKE_LATEST: ${{ inputs.make_latest }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $arguments = @(
+              "release",
+              "edit",
+              $env:RELEASE_VERSION,
+              "--title",
+              $env:FINAL_RELEASE_TITLE,
+              "--notes-file",
+              $env:RELEASE_NOTES
+          )
+
+          if ($env:INPUT_PRERELEASE -eq "true") {
+              $arguments += "--prerelease"
+          }
+          else {
+              $arguments += "--prerelease=false"
+          }
+
+          if (
+              $env:INPUT_MAKE_LATEST -eq "true" -and
+              $env:INPUT_PRERELEASE -ne "true"
+          ) {
+              $arguments += "--latest"
+          }
+          else {
+              $arguments += "--latest=false"
+          }
+
+          Write-Host "Updating release $env:RELEASE_VERSION"
+
+          & gh @arguments
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "GitHub release update failed."
+          }
+
+          Write-Host "Release metadata updated successfully."
+
+      # ---------------------------------------------------------------
+      # Overwrite assets on an existing release
+      #
+      # --clobber deletes and reuploads assets having the same names.
+      # ---------------------------------------------------------------
+      - name: Replace existing release assets
+        if: steps.release_state.outputs.release_exists == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $arguments = @(
+              "release",
+              "upload",
+              $env:RELEASE_VERSION,
+              "$env:RELEASE_ZIP#NSE delivery data $env:RELEASE_VERSION",
+              "$env:CHECKSUM_FILE#SHA-256 checksum",
+              "$env:RELEASE_NOTES#Release notes",
+              "$env:RELEASE_LICENSE#License",
+              "--clobber"
+          )
+
+          Write-Host (
+              "Replacing release assets for " +
+              $env:RELEASE_VERSION
+          )
+
+          & gh @arguments
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Replacing GitHub release assets failed."
+          }
+
+          Write-Host "Release assets replaced successfully."
+
+      # ---------------------------------------------------------------
+      # Verify published release and assets
+      # ---------------------------------------------------------------
+      - name: Verify published release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $releaseJson = gh release view `
+              $env:RELEASE_VERSION `
+              --json `
+              tagName,name,isDraft,isPrerelease,assets,url
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Unable to verify the published release."
+          }
+
+          $release = $releaseJson |
+              ConvertFrom-Json
+
+          $expectedAssets = @(
+              $env:RELEASE_ZIP
+              $env:CHECKSUM_FILE
+              $env:RELEASE_NOTES
+              $env:RELEASE_LICENSE
+          )
+
+          $publishedAssets = @(
+              $release.assets |
+              ForEach-Object {
+                  $_.name
+              }
+          )
+
+          foreach ($expectedAsset in $expectedAssets) {
+              if ($expectedAsset -notin $publishedAssets) {
+                  throw (
+                      "Expected release asset is missing: " +
+                      $expectedAsset
+                  )
+              }
+          }
+
+          "RELEASE_URL=$($release.url)" >> $env:GITHUB_ENV
+
+          Write-Host "Release verification passed."
+          Write-Host "Release URL: $($release.url)"
+          Write-Host "Published assets:"
+
+          $publishedAssets |
+              ForEach-Object {
+                  Write-Host " - $_"
+              }
 
       # ---------------------------------------------------------------
       # Workflow summary
@@ -461,19 +808,29 @@ jobs:
         if: success()
         shell: pwsh
         run: |
-          $repository = "${{ github.repository }}"
-          $version = $env:RELEASE_VERSION
+          if (
+              "${{ steps.release_state.outputs.release_exists }}" -eq
+              "true"
+          ) {
+              $operation = "Updated existing release and replaced assets"
+          }
+          else {
+              $operation = "Created new release"
+          }
 
           @"
-          ## Versioned NSE Delivery Release Published
+          ## Versioned NSE Delivery Release
 
-          - **Version:** ``$version``
+          - **Operation:** $operation
+          - **Version:** ``$env:RELEASE_VERSION``
           - **Title:** $env:FINAL_RELEASE_TITLE
           - **CSV files:** $env:CSV_FILE_COUNT
+          - **Uncompressed CSV size:** $env:CSV_TOTAL_SIZE_MB MB
           - **Archive:** ``$env:RELEASE_ZIP``
           - **Archive size:** $env:ARCHIVE_SIZE_MB MB
-          - **Checksum:** ``$env:RELEASE_ZIP.sha256``
+          - **Checksum:** ``$env:CHECKSUM_FILE``
+          - **Release notes:** ``$env:RELEASE_NOTES``
           - **Pre-release:** ${{ inputs.prerelease }}
           - **Latest release:** ${{ inputs.make_latest }}
-          - **Release:** https://github.com/$repository/releases/tag/$version
+          - **Release:** $env:RELEASE_URL
           "@ >> $env:GITHUB_STEP_SUMMARY

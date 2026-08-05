@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
   schedule:
-    # GitHub cron uses UTC.
+    # GitHub Actions cron uses UTC.
 
     # 07:00, 16:00 and 17:00 IST
     - cron: "30 1,10,11 * * *"
@@ -25,15 +25,16 @@ env:
   RELEASE_ZIP: Day_Delivery.zip
   RELEASE_NOTES: RELEASE_NOTES.md
   RELEASE_LICENSE: LICENSE
+  RELEASE_TEMPLATE: .github/release-notes/latest.md
 
 jobs:
   download-commit-and-release:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       # ---------------------------------------------------------------
-      # Checkout
+      # Checkout repository
       # ---------------------------------------------------------------
       - name: Check out repository
         uses: actions/checkout@v4
@@ -41,18 +42,20 @@ jobs:
           fetch-depth: 0
 
       # ---------------------------------------------------------------
-      # Download data
+      # Download missing NSE delivery files
       # ---------------------------------------------------------------
       - name: Download missing delivery data
         shell: cmd
         run: call delivery_data_downloader.bat
 
       # ---------------------------------------------------------------
-      # Detect, commit and push new CSV files
+      # Commit and push newly downloaded CSV files
       # ---------------------------------------------------------------
       - name: Commit and push newly downloaded CSV files
         id: commit_data
         shell: pwsh
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -61,112 +64,217 @@ jobs:
 
           git add -- "Day_Delivery/NSE/*.csv"
 
-          if (git diff --cached --quiet) {
+          git diff --cached --quiet
+
+          if ($LASTEXITCODE -eq 0) {
               Write-Host "No new delivery CSV files were downloaded."
 
               "has_changes=false" >> $env:GITHUB_OUTPUT
               "commit_sha=" >> $env:GITHUB_OUTPUT
+              "file_count=0" >> $env:GITHUB_OUTPUT
+
               exit 0
           }
 
-          # Only files added during this workflow run.
           $downloadedFiles = @(
-              git diff --cached --name-only --diff-filter=A |
-              Where-Object { $_ -and $_.Trim() -ne "" }
+              git diff `
+                  --cached `
+                  --name-only `
+                  --diff-filter=A |
+              Where-Object {
+                  -not [string]::IsNullOrWhiteSpace($_)
+              }
           )
 
           if ($downloadedFiles.Count -eq 0) {
-              Write-Host "No newly added CSV files were detected."
+              Write-Host "No newly added delivery CSV files were detected."
 
               git reset
 
               "has_changes=false" >> $env:GITHUB_OUTPUT
               "commit_sha=" >> $env:GITHUB_OUTPUT
+              "file_count=0" >> $env:GITHUB_OUTPUT
+
               exit 0
           }
 
           Write-Host "New delivery files:"
-          $downloadedFiles | ForEach-Object {
-              Write-Host " - $_"
-          }
 
-          # Save the list for release-note generation.
+          $downloadedFiles |
+              ForEach-Object {
+                  Write-Host " - $_"
+              }
+
+          $downloadedFilesPath = Join-Path `
+              $env:RUNNER_TEMP `
+              "downloaded-files.txt"
+
           $downloadedFiles |
               Set-Content `
-                  -Path "$env:RUNNER_TEMP\downloaded-files.txt" `
+                  -Path $downloadedFilesPath `
                   -Encoding utf8
 
-          $commitMessage = "data: add $($downloadedFiles.Count) NSE delivery file(s)"
+          $commitMessage = (
+              "data: add " +
+              $downloadedFiles.Count +
+              " NSE delivery file(s)"
+          )
 
-          git commit -m $commitMessage
-          git push origin "HEAD:${{ github.event.repository.default_branch }}"
+          git commit `
+              -m $commitMessage
 
-          $commitSha = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) {
+              throw "Creating the delivery-data commit failed."
+          }
+
+          git push `
+              origin `
+              "HEAD:$env:DEFAULT_BRANCH"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Pushing the delivery-data commit failed."
+          }
+
+          $commitSha = (
+              git rev-parse HEAD
+          ).Trim()
 
           "has_changes=true" >> $env:GITHUB_OUTPUT
           "commit_sha=$commitSha" >> $env:GITHUB_OUTPUT
           "file_count=$($downloadedFiles.Count)" >> $env:GITHUB_OUTPUT
 
+          Write-Host "Committed and pushed new delivery data."
+          Write-Host "Commit: $commitSha"
+
       # ---------------------------------------------------------------
-      # Generate release notes
+      # Generate rolling release notes
+      #
+      # Runs only when one or more new delivery files were committed.
       # ---------------------------------------------------------------
-      - name: Generate release notes
+      - name: Generate latest release notes
         if: steps.commit_data.outputs.has_changes == 'true'
         shell: pwsh
+        env:
+          COMMIT_SHA: ${{ steps.commit_data.outputs.commit_sha }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $releaseDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss 'UTC'"
-          $commitSha = "${{ steps.commit_data.outputs.commit_sha }}"
-          $shortSha = $commitSha.Substring(0, 7)
-          $fileCount = "${{ steps.commit_data.outputs.file_count }}"
+          $templatePath = $env:RELEASE_TEMPLATE
 
-          $downloadedFiles = @(
-              Get-Content "$env:RUNNER_TEMP\downloaded-files.txt" |
-              Where-Object { $_ -and $_.Trim() -ne "" }
-          )
-
-          $notes = @()
-          $notes += "# NSE Delivery Data"
-          $notes += ""
-          $notes += "Latest packaged NSE delivery dataset."
-          $notes += ""
-          $notes += "## Release information"
-          $notes += ""
-          $notes += "- Published: $releaseDate"
-          $notes += "- Commit: ``$shortSha``"
-          $notes += "- Newly downloaded files: $fileCount"
-          $notes += "- Archive: ``${{ env.RELEASE_ZIP }}``"
-          $notes += ""
-          $notes += "## Files added in this update"
-          $notes += ""
-
-          foreach ($file in $downloadedFiles) {
-              $notes += "- ``$file``"
+          if (-not (Test-Path $templatePath -PathType Leaf)) {
+              throw "Latest release-note template not found: $templatePath"
           }
 
-          $notes += ""
-          $notes += "## Archive contents"
-          $notes += ""
-          $notes += "The ZIP archive contains the complete ``Day_Delivery`` folder,"
-          $notes += "including all delivery CSV files currently available in the repository."
-          $notes += ""
-          $notes += "## License"
-          $notes += ""
-          $notes += "See the attached ``LICENSE`` asset and the license file included"
-          $notes += "inside the ZIP archive."
+          $downloadedFilesPath = Join-Path `
+              $env:RUNNER_TEMP `
+              "downloaded-files.txt"
 
-          $notes |
-              Set-Content `
-                  -Path "${{ env.RELEASE_NOTES }}" `
-                  -Encoding utf8
+          if (-not (Test-Path $downloadedFilesPath -PathType Leaf)) {
+              throw "Downloaded-file list not found: $downloadedFilesPath"
+          }
 
-          Write-Host "Generated release notes:"
-          Get-Content "${{ env.RELEASE_NOTES }}"
+          $downloadedFiles = @(
+              Get-Content `
+                  -Path $downloadedFilesPath |
+              Where-Object {
+                  -not [string]::IsNullOrWhiteSpace($_)
+              }
+          )
+
+          if ($downloadedFiles.Count -eq 0) {
+              throw "No downloaded files were available for release notes."
+          }
+
+          $allCsvFiles = @(
+              Get-ChildItem `
+                  -Path "Day_Delivery" `
+                  -Filter "*.csv" `
+                  -File `
+                  -Recurse
+          )
+
+          if ($allCsvFiles.Count -eq 0) {
+              throw "No CSV files were found inside Day_Delivery."
+          }
+
+          $totalBytes = (
+              $allCsvFiles |
+              Measure-Object `
+                  -Property Length `
+                  -Sum
+          ).Sum
+
+          $totalSizeMB = [Math]::Round(
+              $totalBytes / 1MB,
+              2
+          )
+
+          $commitSha = $env:COMMIT_SHA.Trim()
+
+          if ([string]::IsNullOrWhiteSpace($commitSha)) {
+              throw "The committed source SHA is empty."
+          }
+
+          if ($commitSha.Length -ge 7) {
+              $shortCommit = $commitSha.Substring(0, 7)
+          }
+          else {
+              $shortCommit = $commitSha
+          }
+
+          $newFileList = (
+              $downloadedFiles |
+              ForEach-Object {
+                  "- ``$_``"
+              }
+          ) -join [Environment]::NewLine
+
+          $utcNow = (Get-Date).ToUniversalTime()
+
+          $content = Get-Content `
+              -Path $templatePath `
+              -Raw
+
+          $replacements = [ordered]@{
+              "{{DATE}}"              = $utcNow.ToString("yyyy-MM-dd")
+              "{{TIME}}"              = $utcNow.ToString("HH:mm:ss")
+              "{{DATETIME}}"          = $utcNow.ToString("yyyy-MM-dd HH:mm:ss")
+              "{{NEW_FILE_COUNT}}"    = [string]$downloadedFiles.Count
+              "{{SHORT_COMMIT}}"      = $shortCommit
+              "{{COMMIT}}"            = $commitSha
+              "{{ARCHIVE_NAME}}"      = $env:RELEASE_ZIP
+              "{{TOTAL_FILE_COUNT}}"  = [string]$allCsvFiles.Count
+              "{{TOTAL_SIZE_MB}}"     = [string]$totalSizeMB
+              "{{NEW_FILES}}"         = $newFileList
+          }
+
+          foreach ($placeholder in $replacements.Keys) {
+              $content = $content.Replace(
+                  $placeholder,
+                  $replacements[$placeholder]
+              )
+          }
+
+          Set-Content `
+              -Path $env:RELEASE_NOTES `
+              -Value $content `
+              -Encoding utf8
+
+          if (-not (Test-Path $env:RELEASE_NOTES -PathType Leaf)) {
+              throw "Failed to generate $env:RELEASE_NOTES."
+          }
+
+          "TOTAL_CSV_FILE_COUNT=$($allCsvFiles.Count)" >> $env:GITHUB_ENV
+          "TOTAL_CSV_SIZE_MB=$totalSizeMB" >> $env:GITHUB_ENV
+
+          Write-Host "Generated rolling release notes."
+          Write-Host "New files: $($downloadedFiles.Count)"
+          Write-Host "Total files: $($allCsvFiles.Count)"
+          Write-Host "Total size: $totalSizeMB MB"
+          Write-Host "Commit: $shortCommit"
 
       # ---------------------------------------------------------------
-      # Prepare license
-      # Supports LICENSE, LICENSE.txt or LICENSE.md in the repository.
+      # Locate and normalize repository license
       # ---------------------------------------------------------------
       - name: Prepare license asset
         if: steps.commit_data.outputs.has_changes == 'true'
@@ -181,12 +289,16 @@ jobs:
           )
 
           $sourceLicense = $licenseCandidates |
-              Where-Object { Test-Path $_ -PathType Leaf } |
+              Where-Object {
+                  Test-Path `
+                      -Path $_ `
+                      -PathType Leaf
+              } |
               Select-Object -First 1
 
           if (-not $sourceLicense) {
               throw @"
-          No license file was found.
+          No repository license file was found.
 
           Add one of these files to the repository root:
           - LICENSE
@@ -195,24 +307,34 @@ jobs:
           "@
           }
 
-          $sourceFullPath = (Resolve-Path $sourceLicense).Path
-          $targetFullPath = Join-Path $PWD "${{ env.RELEASE_LICENSE }}"
+          $sourceFullPath = (
+              Resolve-Path $sourceLicense
+          ).Path
+
+          $targetFullPath = Join-Path `
+              $PWD.Path `
+              $env:RELEASE_LICENSE
 
           if ($sourceFullPath -ne $targetFullPath) {
               Copy-Item `
                   -Path $sourceLicense `
-                  -Destination "${{ env.RELEASE_LICENSE }}" `
+                  -Destination $env:RELEASE_LICENSE `
                   -Force
+          }
+
+          if (-not (Test-Path $env:RELEASE_LICENSE -PathType Leaf)) {
+              throw "Failed to prepare the release license."
           }
 
           Write-Host "Using license file: $sourceLicense"
 
       # ---------------------------------------------------------------
-      # Create complete ZIP
-      # RELEASE_NOTES.md and LICENSE are copied into Day_Delivery first,
-      # so they are available both inside the ZIP and as release assets.
+      # Prepare isolated release package
+      #
+      # RELEASE_NOTES.md and LICENSE are placed inside the ZIP without
+      # modifying the repository's tracked Day_Delivery directory.
       # ---------------------------------------------------------------
-      - name: Create Day_Delivery ZIP archive
+      - name: Prepare release package
         if: steps.commit_data.outputs.has_changes == 'true'
         shell: pwsh
         run: |
@@ -222,38 +344,110 @@ jobs:
               throw "Day_Delivery folder does not exist."
           }
 
-          # Include release documentation inside the archive.
+          if (-not (Test-Path $env:RELEASE_NOTES -PathType Leaf)) {
+              throw "Release notes do not exist: $env:RELEASE_NOTES"
+          }
+
+          if (-not (Test-Path $env:RELEASE_LICENSE -PathType Leaf)) {
+              throw "License does not exist: $env:RELEASE_LICENSE"
+          }
+
+          $stagingRoot = Join-Path `
+              $env:RUNNER_TEMP `
+              "nse-latest-release"
+
+          $stagingFolder = Join-Path `
+              $stagingRoot `
+              "Day_Delivery"
+
+          if (Test-Path $stagingRoot) {
+              Remove-Item `
+                  -Path $stagingRoot `
+                  -Recurse `
+                  -Force
+          }
+
+          New-Item `
+              -Path $stagingRoot `
+              -ItemType Directory `
+              -Force |
+              Out-Null
+
           Copy-Item `
-              -Path "${{ env.RELEASE_NOTES }}" `
-              -Destination "Day_Delivery\RELEASE_NOTES.md" `
+              -Path "Day_Delivery" `
+              -Destination $stagingRoot `
+              -Recurse `
+              -Force
+
+          if (-not (Test-Path $stagingFolder -PathType Container)) {
+              throw "Failed to create the staged Day_Delivery directory."
+          }
+
+          Copy-Item `
+              -Path $env:RELEASE_NOTES `
+              -Destination (
+                  Join-Path `
+                      $stagingFolder `
+                      "RELEASE_NOTES.md"
+              ) `
               -Force
 
           Copy-Item `
-              -Path "${{ env.RELEASE_LICENSE }}" `
-              -Destination "Day_Delivery\LICENSE" `
+              -Path $env:RELEASE_LICENSE `
+              -Destination (
+                  Join-Path `
+                      $stagingFolder `
+                      "LICENSE"
+              ) `
               -Force
 
-          if (Test-Path "${{ env.RELEASE_ZIP }}") {
-              Remove-Item "${{ env.RELEASE_ZIP }}" -Force
+          "RELEASE_STAGING_ROOT=$stagingRoot" >> $env:GITHUB_ENV
+          "RELEASE_STAGING_FOLDER=$stagingFolder" >> $env:GITHUB_ENV
+
+          Write-Host "Release package staging directory prepared."
+          Write-Host $stagingFolder
+
+      # ---------------------------------------------------------------
+      # Create complete rolling ZIP archive
+      # ---------------------------------------------------------------
+      - name: Create Day_Delivery ZIP archive
+        if: steps.commit_data.outputs.has_changes == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (Test-Path $env:RELEASE_ZIP) {
+              Remove-Item `
+                  -Path $env:RELEASE_ZIP `
+                  -Force
           }
 
           Compress-Archive `
-              -Path "Day_Delivery" `
-              -DestinationPath "${{ env.RELEASE_ZIP }}" `
+              -Path $env:RELEASE_STAGING_FOLDER `
+              -DestinationPath $env:RELEASE_ZIP `
               -CompressionLevel Optimal `
               -Force
 
-          $archive = Get-Item "${{ env.RELEASE_ZIP }}"
+          if (-not (Test-Path $env:RELEASE_ZIP -PathType Leaf)) {
+              throw "ZIP archive was not created."
+          }
 
-          if ($archive.Length -eq 0) {
+          $archive = Get-Item $env:RELEASE_ZIP
+
+          if ($archive.Length -le 0) {
               throw "Generated ZIP archive is empty."
           }
 
-          $sizeMB = [Math]::Round($archive.Length / 1MB, 2)
+          $archiveSizeMB = [Math]::Round(
+              $archive.Length / 1MB,
+              2
+          )
+
+          "ARCHIVE_SIZE_MB=$archiveSizeMB" >> $env:GITHUB_ENV
 
           Write-Host "Archive created successfully."
           Write-Host "Archive: $($archive.Name)"
-          Write-Host "Size: $sizeMB MB"
+          Write-Host "Size: $archiveSizeMB MB"
 
       # ---------------------------------------------------------------
       # Generate SHA-256 checksum
@@ -264,23 +458,35 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          $checksumFile = "$env:RELEASE_ZIP.sha256"
+
           $hash = Get-FileHash `
-              -Path "${{ env.RELEASE_ZIP }}" `
+              -Path $env:RELEASE_ZIP `
               -Algorithm SHA256
 
-          $checksumLine = "$($hash.Hash.ToLower())  ${{ env.RELEASE_ZIP }}"
+          $checksumLine = (
+              "$($hash.Hash.ToLower())  " +
+              $env:RELEASE_ZIP
+          )
 
-          $checksumLine |
-              Set-Content `
-                  -Path "${{ env.RELEASE_ZIP }}.sha256" `
-                  -Encoding ascii
+          Set-Content `
+              -Path $checksumFile `
+              -Value $checksumLine `
+              -Encoding ascii
+
+          if (-not (Test-Path $checksumFile -PathType Leaf)) {
+              throw "Checksum file was not created."
+          }
+
+          "CHECKSUM_FILE=$checksumFile" >> $env:GITHUB_ENV
 
           Write-Host $checksumLine
 
       # ---------------------------------------------------------------
-      # Create or update rolling release
+      # Detect whether rolling release already exists
       # ---------------------------------------------------------------
-      - name: Publish or replace rolling release
+      - name: Detect existing rolling release
+        id: release_state
         if: steps.commit_data.outputs.has_changes == 'true'
         shell: pwsh
         env:
@@ -288,84 +494,243 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $tag = "${{ env.RELEASE_TAG }}"
-          $title = "${{ env.RELEASE_TITLE }}"
-          $target = "${{ steps.commit_data.outputs.commit_sha }}"
+          gh release view `
+              $env:RELEASE_TAG `
+              --json tagName `
+              *> $null
 
-          # Check whether the rolling release already exists.
-          gh release view $tag *> $null
-          $releaseExists = ($LASTEXITCODE -eq 0)
-
-          if (-not $releaseExists) {
-              Write-Host "Creating rolling release: $tag"
-
-              gh release create $tag `
-                  "${{ env.RELEASE_ZIP }}#Complete NSE delivery data archive" `
-                  "${{ env.RELEASE_ZIP }}.sha256#SHA-256 checksum" `
-                  "${{ env.RELEASE_NOTES }}#Release notes" `
-                  "${{ env.RELEASE_LICENSE }}#License" `
-                  --title $title `
-                  --notes-file "${{ env.RELEASE_NOTES }}" `
-                  --target $target `
-                  --latest
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "Rolling release already exists."
+              "release_exists=true" >> $env:GITHUB_OUTPUT
           }
           else {
-              Write-Host "Updating rolling release: $tag"
-
-              # Update release title, body and target information.
-              gh release edit $tag `
-                  --title $title `
-                  --notes-file "${{ env.RELEASE_NOTES }}" `
-                  --target $target `
-                  --latest
-
-              # Replace assets having the same stable filenames.
-              gh release upload $tag `
-                  "${{ env.RELEASE_ZIP }}#Complete NSE delivery data archive" `
-                  "${{ env.RELEASE_ZIP }}.sha256#SHA-256 checksum" `
-                  "${{ env.RELEASE_NOTES }}#Release notes" `
-                  "${{ env.RELEASE_LICENSE }}#License" `
-                  --clobber
+              Write-Host "Rolling release does not exist."
+              "release_exists=false" >> $env:GITHUB_OUTPUT
           }
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "GitHub release publishing failed."
-          }
-
-          Write-Host "Rolling release published successfully."
 
       # ---------------------------------------------------------------
-      # Job summary
+      # Move or create the rolling Git tag
+      #
+      # The rolling tag always points to the latest committed dataset.
+      # ---------------------------------------------------------------
+      - name: Update rolling release tag
+        if: steps.commit_data.outputs.has_changes == 'true'
+        shell: pwsh
+        env:
+          TARGET_COMMIT: ${{ steps.commit_data.outputs.commit_sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $target = $env:TARGET_COMMIT.Trim()
+
+          if ([string]::IsNullOrWhiteSpace($target)) {
+              throw "Rolling release target commit is empty."
+          }
+
+          git tag `
+              --force `
+              $env:RELEASE_TAG `
+              $target
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Creating or updating the local rolling tag failed."
+          }
+
+          git push `
+              origin `
+              "refs/tags/$env:RELEASE_TAG" `
+              --force
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Pushing the rolling release tag failed."
+          }
+
+          Write-Host (
+              "Rolling tag " +
+              $env:RELEASE_TAG +
+              " now points to " +
+              $target
+          )
+
+      # ---------------------------------------------------------------
+      # Create rolling release when it does not exist
+      # ---------------------------------------------------------------
+      - name: Create rolling release
+        if: >-
+          steps.commit_data.outputs.has_changes == 'true' &&
+          steps.release_state.outputs.release_exists == 'false'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & gh release create `
+              $env:RELEASE_TAG `
+              "$env:RELEASE_ZIP#Complete NSE delivery data archive" `
+              "$env:CHECKSUM_FILE#SHA-256 checksum" `
+              "$env:RELEASE_NOTES#Release notes" `
+              "$env:RELEASE_LICENSE#License" `
+              --title $env:RELEASE_TITLE `
+              --notes-file $env:RELEASE_NOTES `
+              --verify-tag `
+              --latest
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Creating the rolling release failed."
+          }
+
+          Write-Host "Rolling release created successfully."
+
+      # ---------------------------------------------------------------
+      # Update release metadata when release already exists
+      # ---------------------------------------------------------------
+      - name: Update rolling release metadata
+        if: >-
+          steps.commit_data.outputs.has_changes == 'true' &&
+          steps.release_state.outputs.release_exists == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & gh release edit `
+              $env:RELEASE_TAG `
+              --title $env:RELEASE_TITLE `
+              --notes-file $env:RELEASE_NOTES `
+              --latest
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Updating rolling release metadata failed."
+          }
+
+          Write-Host "Rolling release metadata updated successfully."
+
+      # ---------------------------------------------------------------
+      # Replace existing release assets
+      # ---------------------------------------------------------------
+      - name: Replace rolling release assets
+        if: >-
+          steps.commit_data.outputs.has_changes == 'true' &&
+          steps.release_state.outputs.release_exists == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & gh release upload `
+              $env:RELEASE_TAG `
+              "$env:RELEASE_ZIP#Complete NSE delivery data archive" `
+              "$env:CHECKSUM_FILE#SHA-256 checksum" `
+              "$env:RELEASE_NOTES#Release notes" `
+              "$env:RELEASE_LICENSE#License" `
+              --clobber
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Replacing rolling release assets failed."
+          }
+
+          Write-Host "Rolling release assets replaced successfully."
+
+      # ---------------------------------------------------------------
+      # Verify release and expected assets
+      # ---------------------------------------------------------------
+      - name: Verify rolling release
+        if: steps.commit_data.outputs.has_changes == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $releaseJson = gh release view `
+              $env:RELEASE_TAG `
+              --json `
+              tagName,name,isDraft,isPrerelease,assets,url
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Unable to read the published rolling release."
+          }
+
+          $release = $releaseJson |
+              ConvertFrom-Json
+
+          $expectedAssets = @(
+              $env:RELEASE_ZIP
+              $env:CHECKSUM_FILE
+              $env:RELEASE_NOTES
+              $env:RELEASE_LICENSE
+          )
+
+          $publishedAssets = @(
+              $release.assets |
+              ForEach-Object {
+                  $_.name
+              }
+          )
+
+          foreach ($expectedAsset in $expectedAssets) {
+              if ($expectedAsset -notin $publishedAssets) {
+                  throw (
+                      "Expected release asset is missing: " +
+                      $expectedAsset
+                  )
+              }
+          }
+
+          "RELEASE_URL=$($release.url)" >> $env:GITHUB_ENV
+
+          Write-Host "Rolling release verification passed."
+          Write-Host "Release URL: $($release.url)"
+          Write-Host "Published assets:"
+
+          $publishedAssets |
+              ForEach-Object {
+                  Write-Host " - $_"
+              }
+
+      # ---------------------------------------------------------------
+      # Workflow summary
       # ---------------------------------------------------------------
       - name: Write workflow summary
         if: always()
         shell: pwsh
+        env:
+          HAS_CHANGES: ${{ steps.commit_data.outputs.has_changes }}
+          FILE_COUNT: ${{ steps.commit_data.outputs.file_count }}
+          COMMIT_SHA: ${{ steps.commit_data.outputs.commit_sha }}
         run: |
-          if ("${{ steps.commit_data.outputs.has_changes }}" -ne "true") {
+          if ($env:HAS_CHANGES -ne "true") {
               @"
           ## NSE Delivery Data
 
           No new delivery CSV files were found.
 
-          The existing release was not modified.
+          The existing rolling release was not modified.
           "@ >> $env:GITHUB_STEP_SUMMARY
 
               exit 0
           }
 
-          $repository = "${{ github.repository }}"
-          $tag = "${{ env.RELEASE_TAG }}"
-          $fileCount = "${{ steps.commit_data.outputs.file_count }}"
-          $commitSha = "${{ steps.commit_data.outputs.commit_sha }}"
-          $shortSha = $commitSha.Substring(0, 7)
+          $shortSha = $env:COMMIT_SHA
+
+          if ($shortSha.Length -ge 7) {
+              $shortSha = $shortSha.Substring(0, 7)
+          }
 
           @"
           ## NSE Delivery Data Published
 
-          - **New CSV files:** $fileCount
+          - **New CSV files:** $env:FILE_COUNT
+          - **Total CSV files:** $env:TOTAL_CSV_FILE_COUNT
+          - **Total CSV size:** $env:TOTAL_CSV_SIZE_MB MB
           - **Commit:** ``$shortSha``
-          - **Release tag:** ``$tag``
-          - **ZIP asset:** ``${{ env.RELEASE_ZIP }}``
-          - **Checksum:** ``${{ env.RELEASE_ZIP }}.sha256``
-          - **Release:** https://github.com/$repository/releases/tag/$tag
+          - **Release tag:** ``$env:RELEASE_TAG``
+          - **ZIP asset:** ``$env:RELEASE_ZIP``
+          - **Archive size:** $env:ARCHIVE_SIZE_MB MB
+          - **Checksum:** ``$env:CHECKSUM_FILE``
+          - **Release notes:** ``$env:RELEASE_NOTES``
+          - **Release:** $env:RELEASE_URL
           "@ >> $env:GITHUB_STEP_SUMMARY
