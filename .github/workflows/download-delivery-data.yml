@@ -18,7 +18,7 @@ on:
 
     # Runs at 15:37 and 16:37 IST.
     # 10:07 and 11:07 UTC respectively.
-    # - cron: "7 10,11 * * 1-5"
+    - cron: "7 10,11 * * 1-5"
 
 permissions:
   contents: write
@@ -559,26 +559,27 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           # A missing release is expected on the first publication.
-          # Do not let PowerShell convert gh exit code 1 into a
-          # terminating error before we can inspect $LASTEXITCODE.
-          $previousPreference = `
-              $PSNativeCommandUseErrorActionPreference
+          # Start-Process prevents gh exit code 1 from becoming the
+          # PowerShell step's final native-command exit code.
+          $stdoutFile = Join-Path $env:RUNNER_TEMP "release-view.stdout.txt"
+          $stderrFile = Join-Path $env:RUNNER_TEMP "release-view.stderr.txt"
 
-          $PSNativeCommandUseErrorActionPreference = $false
+          $ghProcess = Start-Process `
+              -FilePath "gh" `
+              -ArgumentList @(
+                  "release",
+                  "view",
+                  $env:RELEASE_TAG,
+                  "--json",
+                  "tagName"
+              ) `
+              -RedirectStandardOutput $stdoutFile `
+              -RedirectStandardError $stderrFile `
+              -NoNewWindow `
+              -Wait `
+              -PassThru
 
-          try {
-              & gh release view `
-                  $env:RELEASE_TAG `
-                  --json tagName `
-                  1>$null `
-                  2>$null
-
-              $releaseViewExitCode = $LASTEXITCODE
-          }
-          finally {
-              $PSNativeCommandUseErrorActionPreference = `
-                  $previousPreference
-          }
+          $releaseViewExitCode = $ghProcess.ExitCode
 
           if ($releaseViewExitCode -eq 0) {
               Write-Host "Rolling release already exists."
@@ -589,11 +590,22 @@ jobs:
               "release_exists=false" >> $env:GITHUB_OUTPUT
           }
           else {
+              $errorText = ""
+
+              if (Test-Path $stderrFile -PathType Leaf) {
+                  $errorText = (Get-Content -Path $stderrFile -Raw).Trim()
+              }
+
               throw (
                   "Unable to check rolling release state. " +
-                  "GitHub CLI exit code: $releaseViewExitCode"
+                  "GitHub CLI exit code: $releaseViewExitCode. " +
+                  $errorText
               )
           }
+
+          # Ensure the runner does not inherit a handled non-zero native exit.
+          $global:LASTEXITCODE = 0
+          exit 0
 
       # ---------------------------------------------------------------
       # Move or create the rolling Git tag
