@@ -6,11 +6,13 @@ on:
   schedule:
     # GitHub Actions cron uses UTC.
 
-    # Runs at 07:00, 16:00 and 17:00 IST (Correct ✅)
-    - cron: "37 1,13,14,15 * * *"
+    # Runs at 16:07 and 17:07 IST.
+    # Minute 07 avoids the busiest top-of-hour scheduling window.
+    - cron: "37 10,11 * * 1-5"
 
-    # Runs at 15:30 and 16:30 IST (Corrected 🛠️)
-    - cron: "7 13,14,15 * * *"
+    # Runs at 15:37 and 16:37 IST.
+    # 10:07 and 11:07 UTC respectively.
+    # - cron: "7 10,11 * * 1-5"
 
 permissions:
   contents: write
@@ -494,18 +496,41 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          gh release view `
-              $env:RELEASE_TAG `
-              --json tagName `
-              *> $null
+          # A missing release is expected on the first publication.
+          # Do not let PowerShell convert gh exit code 1 into a
+          # terminating error before we can inspect $LASTEXITCODE.
+          $previousPreference = `
+              $PSNativeCommandUseErrorActionPreference
 
-          if ($LASTEXITCODE -eq 0) {
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          try {
+              & gh release view `
+                  $env:RELEASE_TAG `
+                  --json tagName `
+                  1>$null `
+                  2>$null
+
+              $releaseViewExitCode = $LASTEXITCODE
+          }
+          finally {
+              $PSNativeCommandUseErrorActionPreference = `
+                  $previousPreference
+          }
+
+          if ($releaseViewExitCode -eq 0) {
               Write-Host "Rolling release already exists."
               "release_exists=true" >> $env:GITHUB_OUTPUT
           }
-          else {
+          elseif ($releaseViewExitCode -eq 1) {
               Write-Host "Rolling release does not exist."
               "release_exists=false" >> $env:GITHUB_OUTPUT
+          }
+          else {
+              throw (
+                  "Unable to check rolling release state. " +
+                  "GitHub CLI exit code: $releaseViewExitCode"
+              )
           }
 
       # ---------------------------------------------------------------
